@@ -8,20 +8,19 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/vnd.vegvesen.nvdb-v4+json, application/json",
     "X-Client": "elch-radar-norwegen"
 }
 
-# Offizielle Vegvesen- und NVDB-Endpunkte für alle Verkehrskameras in Norwegen
-CAMERA_ENDPOINTS = [
-    "https://www.vegvesen.no/trafikk/api/camera/all",
-    "https://www.vegvesen.no/trafikkbeta/api/camera/all",
-    "https://www.vegvesen.no/ws/no/vegvesen/veg/trafikk/webkamera/v1/kamera",
-    "https://webkamera.atlas.vegvesen.no/public/kameraer",
-    "https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/67?inkluder=egenskaper,vegsystemreferanse&antall=2000",
-    "https://nvdbapiles-v3.atlas.vegvesen.no/vegobjekter/api/v3/vegobjekter/67?inkluder=egenskaper,vegsystemreferanse&antall=2000",
-]
+# Norwegische Regionen (Fylker) für die Ortsangabe
+FYLKER = {
+    3: "Oslo", 11: "Rogaland", 15: "Møre og Romsdal", 18: "Nordland",
+    30: "Viken", 31: "Østfold", 32: "Akershus", 33: "Buskerud",
+    34: "Innlandet", 38: "Vestfold og Telemark", 39: "Vestfold",
+    40: "Telemark", 42: "Agder", 46: "Vestland", 50: "Trøndelag",
+    54: "Troms og Finnmark", 55: "Troms", 56: "Finnmark"
+}
 
 model = YOLO("yolov8n.pt")
 
@@ -36,108 +35,78 @@ else:
     seen_images = set()
 
 
-def parse_cameras(data):
+def get_all_cameras():
     cameras = []
     seen_urls = set()
+    # Objekttyp 67 in der Nasjonal vegdatabank (NVDB) = Verkehrskamera
+    url = "https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/67?inkluder=egenskaper,lokasjon&antall=1000"
 
-    # Fall 1: NVDB-API Format (Nasjonal vegdatabank, Objekttyp 67 = Kamera)
-    if isinstance(data, dict) and "objekter" in data:
-        for obj in data["objekter"]:
-            cam_id = str(obj.get("id", ""))
-            img_url = None
-            place = None
-
-            for eg in obj.get("egenskaper", []):
-                val = eg.get("verdi")
-                navn = str(eg.get("navn", ""))
-                if isinstance(val, str) and val.startswith("http"):
-                    img_url = val
-                elif isinstance(val, str) and navn in ("Stedsnavn", "Navn", "Beskrivelse", "Tittel"):
-                    place = val
-
-            road = obj.get("vegsystemreferanse", {}).get("kortform", "")
-            label = f"{place or 'Verkehrskamera'} ({road})".strip() if road else (place or f"Kamera {cam_id}")
-
-            if img_url and img_url not in seen_urls:
-                seen_urls.add(img_url)
-                cameras.append({"id": cam_id, "name": label, "url": img_url})
-        return cameras
-
-    # Fall 2: Standard-Liste, GeoJSON oder verschachteltes JSON
-    items = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        for key in ("features", "cameras", "kameraer", "items", "data"):
-            if isinstance(data.get(key), list):
-                items = data[key]
+    while url:
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=25)
+            if res.status_code != 200:
+                print(f"NVDB-Fehler (Status {res.status_code}): {res.text[:250]}")
                 break
 
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
-        merged = {**item, **props}
-
-        cam_id = merged.get("id") or merged.get("kameraId") or merged.get("cameraId")
-        img_url = None
-        for url_key in ("url", "stillImageUrl", "imageUrl", "bildeUrl", "href"):
-            val = merged.get(url_key)
-            if isinstance(val, str) and val.startswith("http"):
-                img_url = val
+            data = res.json()
+            objekter = data.get("objekter", [])
+            if not objekter:
                 break
 
-        if not img_url and cam_id:
-            img_url = f"https://webkamera.atlas.vegvesen.no/public/kamera?id={cam_id}"
+            for obj in objekter:
+                cam_id = str(obj.get("id", ""))
+                img_url = None
+                web_cam_id = None
+                place = None
 
-        name = (
-            merged.get("stedsnavn")
-            or merged.get("name")
-            or merged.get("navn")
-            or merged.get("beskrivelse")
-            or merged.get("description")
-            or merged.get("title")
-            or f"Kamera {cam_id}"
-        )
-        fylke = merged.get("fylke") or merged.get("county") or merged.get("region") or "Norwegen"
+                for eg in obj.get("egenskaper", []):
+                    val = eg.get("verdi")
+                    navn = str(eg.get("navn", "")).lower()
 
-        if img_url and img_url not in seen_urls:
-            seen_urls.add(img_url)
-            cameras.append({
-                "id": str(cam_id or len(cameras)),
-                "name": f"{name} ({fylke})",
-                "url": img_url
-            })
+                    if isinstance(val, str) and val.startswith("http"):
+                        img_url = val
+                    elif "kamera" in navn and "id" in navn and val:
+                        web_cam_id = str(val)
+                    elif isinstance(val, str) and any(k in navn for k in ("stedsnavn", "navn", "beskrivelse", "plassering", "tittel")):
+                        if not place:
+                            place = val
+
+                if not img_url and web_cam_id:
+                    img_url = f"https://webkamera.atlas.vegvesen.no/public/kamera?id={web_cam_id}"
+
+                lok = obj.get("lokasjon", {})
+                vegsys = lok.get("vegsystemreferanser", [])
+                road = vegsys[0].get("kortform", "").split(" ")[0] if vegsys else ""
+                fylke_ids = lok.get("fylker", [])
+                region = FYLKER.get(fylke_ids[0], "Norwegen") if fylke_ids else "Norwegen"
+
+                title = place or f"Kamera {cam_id}"
+                full_name = f"{title} – {road} ({region})" if road else f"{title} ({region})"
+
+                if img_url and img_url not in seen_urls:
+                    seen_urls.add(img_url)
+                    cameras.append({
+                        "id": cam_id,
+                        "name": full_name,
+                        "url": img_url
+                    })
+
+            # Nächste Seite laden, falls es mehr als 1.000 Kameras gibt
+            next_url = data.get("metadata", {}).get("neste", {}).get("href")
+            url = next_url if next_url and next_url != url else None
+
+        except Exception as e:
+            print(f"Fehler beim Abruf der NVDB-Kameras: {e}")
+            break
 
     return cameras
 
 
-def get_all_cameras():
-    for endpoint in CAMERA_ENDPOINTS:
-        try:
-            res = requests.get(endpoint, headers=HEADERS, timeout=20)
-            if res.status_code != 200 or not res.text.strip():
-                print(f"Überspringe {endpoint} (Status {res.status_code}, leer)")
-                continue
-
-            data = res.json()
-            cameras = parse_cameras(data)
-            if cameras:
-                print(f"Erfolgreich {len(cameras)} Kameras geladen über: {endpoint}")
-                return cameras
-            else:
-                print(f"Keine Kameras im Format von {endpoint} gefunden.")
-        except Exception as e:
-            print(f"Fehler bei {endpoint}: {e}")
-
-    return []
-
-
 def download_image(cam):
     try:
-        r = requests.get(cam["url"], headers=HEADERS, timeout=10)
-        content_type = r.headers.get("Content-Type", "")
-        if r.status_code == 200 and len(r.content) > 5000 and "image" in content_type:
+        r = requests.get(cam["url"], headers={"User-Agent": HEADERS["User-Agent"]}, timeout=12)
+        # Prüfen, ob die Datei groß genug ist und keine HTML-Fehlerseite zurückkam
+        if r.status_code == 200 and len(r.content) > 5000 and not r.content[:20].lstrip().startswith(b"<"):
             img_hash = f"{cam['id']}_{r.headers.get('Last-Modified', len(r.content))}"
             if img_hash in seen_images:
                 return None

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 from collections import Counter
 import requests
@@ -23,8 +24,13 @@ FYLKER = {
     54: "Troms og Finnmark", 55: "Troms", 56: "Finnmark"
 }
 
-model = YOLO("yolov8n.pt")
-ANIMAL_CLASSES = [17, 18, 19, 21]
+# yolov8s ist deutlich treffsicherer bei Tieren als yolov8n und vermeidet Schneehaufen-Fehlalarme
+model = YOLO("yolov8s.pt")
+
+# COCO-Klassen für große Tiere (17=Pferd, 18=Schaf, 19=Kuh, 21=Bär)
+ANIMAL_CLASSES = {17: "Pferd/Elch", 18: "Schaf/Rentier", 19: "Kuh/Elch", 21: "Bär/Elch"}
+CONFIDENCE_THRESHOLD = 0.58
+MAX_ALERTS_PER_RUN = 5
 
 HISTORY_FILE = "seen_moose.json"
 if os.path.exists(HISTORY_FILE):
@@ -63,7 +69,6 @@ def get_nvdb_cameras():
                     val = eg.get("verdi")
                     navn = str(eg.get("navn", "")).lower()
 
-                    # Feld 12211 = Måleutstyrsnummer MSR (der echte Schlüssel für kamera.atlas.vegvesen.no)
                     if (eg_id == 12211 or "måleutstyrsnummer" in navn) and val is not None:
                         msr_id = re.sub(r"\.0$", "", str(val).strip())
                     elif isinstance(val, str) and "kamera.atlas.vegvesen.no/api/images/" in val:
@@ -128,13 +133,11 @@ def download_camera_images(cam):
     results = []
     msr_id = cam["id"]
 
-    # 1. Direkte URL oder Haupt-ID testen
     primary_url = cam["direct_url"] or f"https://kamera.atlas.vegvesen.no/api/images/{msr_id}"
     status, item = try_fetch_url(primary_url, msr_id, cam["name"])
     if status in ("ok", "cached"):
         return [(status, item)]
 
-    # 2. Falls Haupt-ID 404 liefert: alle Blickrichtungen (_1, _2, _3) prüfen
     if "_" not in msr_id:
         for suffix in ("1", "2", "3"):
             sub_id = f"{msr_id}_{suffix}"
@@ -148,8 +151,19 @@ def download_camera_images(cam):
 
 def send_telegram(image_path, caption):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    with open(image_path, "rb") as photo:
-        requests.post(url, data={"chat_id": CHAT_ID, "caption": caption}, files={"photo": photo})
+    for attempt in range(2):
+        with open(image_path, "rb") as photo:
+            res = requests.post(url, data={"chat_id": CHAT_ID, "caption": caption}, files={"photo": photo})
+        if res.status_code == 200:
+            return True
+        if res.status_code == 429:
+            wait = res.json().get("parameters", {}).get("retry_after", 10) + 1
+            print(f"Telegram-Pause ({wait}s)...")
+            time.sleep(wait)
+        else:
+            print(f"Telegram-Fehler: {res.status_code} {res.text}")
+            return False
+    return False
 
 
 def main():
@@ -170,32 +184,53 @@ def main():
     downloaded = [item for status, item in flat_results if status == "ok" and item]
     print(f"{len(downloaded)} neue Kamerabilder geladen. Starte Elch-Erkennung...")
 
+    hits = []
     for item in downloaded:
         filename = item["filename"]
         try:
-            results = model(filename, conf=0.45, verbose=False)
+            results = model(filename, conf=CONFIDENCE_THRESHOLD, verbose=False)
+            best_conf = 0.0
+            best_label = None
+            best_result = None
+
             for r in results:
-                detected = [int(box.cls[0]) for box in r.boxes]
-                if any(cls in ANIMAL_CLASSES for cls in detected):
-                    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", item["id"])
-                    out_file = f"hit_{safe_id}.jpg"
-                    r.save(filename=out_file)
-                    caption = (
-                        f"🦌 Mögliche Elch-Sichtung!\n"
-                        f"📍 Ort: {item['name']}\n"
-                        f"🔗 Live-Bild: {item['url']}"
-                    )
-                    send_telegram(out_file, caption)
-                    seen_images.add(item["img_hash"])
-                    print(f"TREFFER gemeldet: {item['name']}")
-                    if os.path.exists(out_file):
-                        os.remove(out_file)
-                    break
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls_id in ANIMAL_CLASSES and conf > best_conf:
+                        best_conf = conf
+                        best_label = ANIMAL_CLASSES[cls_id]
+                        best_result = r
+
+            if best_result is not None:
+                safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", item["id"])
+                out_file = f"hit_{safe_id}.jpg"
+                best_result.save(filename=out_file)
+                hits.append((best_conf, best_label, item, out_file))
         except Exception as e:
             print(f"Analysefehler bei {item['name']}: {e}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
+
+    # Nach höchster Treffer-Wahrscheinlichkeit sortieren und max. 5 pro Lauf senden
+    hits.sort(key=lambda x: x[0], reverse=True)
+    print(f"Gefundene Treffer über {int(CONFIDENCE_THRESHOLD * 100)}%: {len(hits)}")
+
+    for conf, label, item, out_file in hits[:MAX_ALERTS_PER_RUN]:
+        caption = (
+            f"🦌 Mögliche Sichtung ({label} – {int(conf * 100)}%)\n"
+            f"📍 Ort: {item['name']}\n"
+            f"🔗 Live-Bild: {item['url']}"
+        )
+        if send_telegram(out_file, caption):
+            seen_images.add(item["img_hash"])
+            print(f"TREFFER gemeldet: {item['name']} ({label} {int(conf * 100)}%)")
+            time.sleep(1.5)
+
+    for _, _, _, out_file in hits:
+        if os.path.exists(out_file):
+            os.remove(out_file)
 
     with open(HISTORY_FILE, "w") as f:
         json.dump(list(seen_images)[-2000:], f)

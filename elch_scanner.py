@@ -34,42 +34,9 @@ else:
     seen_images = set()
 
 
-def build_image_urls(candidate_ids, direct_urls):
-    urls = []
-    for u in direct_urls:
-        if "kamera.atlas.vegvesen.no/api/images/" in u and u not in urls:
-            urls.append(u)
-    for raw_id in candidate_ids:
-        clean_id = str(raw_id).strip()
-        if not clean_id:
-            continue
-        variants = [clean_id] if "_" in clean_id else [clean_id, f"{clean_id}_1", f"{clean_id}_2", f"{clean_id}_3"]
-        for v in variants:
-            u = f"https://kamera.atlas.vegvesen.no/api/images/{v}"
-            if u not in urls:
-                urls.append(u)
-    return urls
-
-
-def print_nvdb_camera_schema(nvdb_headers):
-    try:
-        r = requests.get(
-            "https://nvdbapiles.atlas.vegvesen.no/vegobjekttyper/api/v4/vegobjekttyper/163",
-            headers=nvdb_headers,
-            timeout=15
-        )
-        if r.status_code == 200:
-            eg_types = r.json().get("egenskapstyper", [])
-            summary = [f"{e.get('id')}:{e.get('navn')}" for e in eg_types]
-            print("NVDB-Kamerafelder laut Katalog:", ", ".join(summary))
-    except Exception:
-        pass
-
-
 def get_nvdb_cameras():
     cameras = []
-    seen_keys = set()
-    cam_types = Counter()
+    seen_ids = set()
 
     url = "https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/163?inkluder=egenskaper,lokasjon&antall=1000"
     nvdb_headers = {
@@ -77,8 +44,6 @@ def get_nvdb_cameras():
         "Accept": "application/vnd.vegvesen.nvdb-v4+json, application/json",
         "X-Client": "elch-radar-norwegen"
     }
-
-    print_nvdb_camera_schema(nvdb_headers)
 
     while url:
         try:
@@ -89,46 +54,29 @@ def get_nvdb_cameras():
             data = res.json()
             for obj in data.get("objekter", []):
                 egenskaper = obj.get("egenskaper", [])
-
-                cam_type = "Unbekannt"
-                for eg in egenskaper:
-                    if eg.get("id") == 1179 or str(eg.get("navn", "")).lower() == "type kamera":
-                        cam_type = str(eg.get("verdi", "Unbekannt"))
-                        break
-                cam_types[cam_type] += 1
-
-                # Tunnelkameras und ausgemusterte Kameras überspringen
-                if cam_type in ("Fast videokamera", "Utgår_Fotokamera"):
-                    continue
-
-                direct_urls = []
-                candidate_ids = []
+                msr_id = None
+                direct_url = None
                 place = None
 
                 for eg in egenskaper:
+                    eg_id = eg.get("id")
                     val = eg.get("verdi")
                     navn = str(eg.get("navn", "")).lower()
 
-                    if isinstance(val, str) and "http" in val:
-                        direct_urls.append(val.strip())
-                        if "/api/images/" in val:
-                            candidate_ids.append(val.rstrip("/").split("/")[-1])
-                        elif "id=" in val:
-                            candidate_ids.append(val.split("id=")[-1].split("&")[0])
+                    # Feld 12211 = Måleutstyrsnummer MSR (der echte Schlüssel für kamera.atlas.vegvesen.no)
+                    if (eg_id == 12211 or "måleutstyrsnummer" in navn) and val is not None:
+                        msr_id = re.sub(r"\.0$", "", str(val).strip())
+                    elif isinstance(val, str) and "kamera.atlas.vegvesen.no/api/images/" in val:
+                        direct_url = val.strip()
+                        if not msr_id:
+                            msr_id = val.rstrip("/").split("/")[-1]
                     elif isinstance(val, str) and any(k in navn for k in ("stedsnavn", "navn", "beskrivelse", "plassering", "tittel")):
                         if not place and navn != "type kamera":
                             place = val.strip()
-                    elif val is not None and navn != "type kamera" and any(k in navn for k in ("kamera", "ekstern", "nummer", "id", "lenke", "url", "kode")):
-                        candidate_ids.append(str(val).strip())
 
-                urls = build_image_urls(candidate_ids, direct_urls)
-                if not urls:
+                if not msr_id or msr_id in seen_ids:
                     continue
-
-                primary_key = candidate_ids[0] if candidate_ids else urls[0]
-                if primary_key in seen_keys:
-                    continue
-                seen_keys.add(primary_key)
+                seen_ids.add(msr_id)
 
                 lok = obj.get("lokasjon", {})
                 vegsys = lok.get("vegsystemreferanser", [])
@@ -136,12 +84,11 @@ def get_nvdb_cameras():
                 fylke_ids = lok.get("fylker", [])
                 region = FYLKER.get(fylke_ids[0], "Norwegen") if fylke_ids else "Norwegen"
 
-                title = f"{place or 'Kamera ' + primary_key} – {road}" if road else (place or f"Kamera {primary_key}")
+                title = f"{place or 'Kamera ' + msr_id} – {road}" if road else (place or f"Kamera {msr_id}")
                 cameras.append({
-                    "id": primary_key,
+                    "id": msr_id,
                     "name": f"{title} ({region})",
-                    "urls": urls,
-                    "raw_egenskaper": egenskaper
+                    "direct_url": direct_url
                 })
 
             next_url = data.get("metadata", {}).get("neste", {}).get("href")
@@ -150,30 +97,53 @@ def get_nvdb_cameras():
             print(f"NVDB-Hinweis: {e}")
             break
 
-    print(f"NVDB-Kameratypen: {dict(cam_types)}")
-    print(f"Gefundene aktive Kamera-Kandidaten: {len(cameras)}")
+    print(f"NVDB-Auswertung: {len(cameras)} Kameras mit MSR-Nummer gefunden.")
     return cameras
 
 
-def download_image(cam):
-    last_status = "error"
-    for url in cam["urls"]:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            last_status = str(r.status_code)
-            if r.status_code == 200 and len(r.content) > 5000 and not r.content[:20].lstrip().startswith(b"<"):
-                img_hash = f"{cam['id']}_{r.headers.get('Last-Modified', len(r.content))}"
-                if img_hash in seen_images:
-                    return ("cached", cam)
-                safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", cam["id"])
-                filename = f"cam_{safe_id}.jpg"
-                with open(filename, "wb") as f:
-                    f.write(r.content)
-                cam["active_url"] = url
-                return ("ok", (cam, filename, img_hash))
-        except Exception as e:
-            last_status = type(e).__name__
-    return (last_status, cam)
+def try_fetch_url(url, cam_id, cam_name):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code == 200 and len(r.content) > 5000 and not r.content[:20].lstrip().startswith(b"<"):
+            img_hash = f"{cam_id}_{r.headers.get('Last-Modified', len(r.content))}"
+            if img_hash in seen_images:
+                return ("cached", None)
+            safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", cam_id)
+            filename = f"cam_{safe_id}.jpg"
+            with open(filename, "wb") as f:
+                f.write(r.content)
+            return ("ok", {
+                "id": cam_id,
+                "name": cam_name,
+                "url": url,
+                "filename": filename,
+                "img_hash": img_hash
+            })
+        return (str(r.status_code), None)
+    except Exception as e:
+        return (type(e).__name__, None)
+
+
+def download_camera_images(cam):
+    results = []
+    msr_id = cam["id"]
+
+    # 1. Direkte URL oder Haupt-ID testen
+    primary_url = cam["direct_url"] or f"https://kamera.atlas.vegvesen.no/api/images/{msr_id}"
+    status, item = try_fetch_url(primary_url, msr_id, cam["name"])
+    if status in ("ok", "cached"):
+        return [(status, item)]
+
+    # 2. Falls Haupt-ID 404 liefert: alle Blickrichtungen (_1, _2, _3) prüfen
+    if "_" not in msr_id:
+        for suffix in ("1", "2", "3"):
+            sub_id = f"{msr_id}_{suffix}"
+            sub_url = f"https://kamera.atlas.vegvesen.no/api/images/{sub_id}"
+            s_status, s_item = try_fetch_url(sub_url, sub_id, f"{cam['name']} [Blick {suffix}]")
+            if s_status in ("ok", "cached"):
+                results.append((s_status, s_item))
+
+    return results if results else [(status, None)]
 
 
 def send_telegram(image_path, caption):
@@ -190,41 +160,39 @@ def main():
         print("Abbruch: Keine Kameras gefunden.")
         return
 
-    with ThreadPoolExecutor(max_workers=25) as executor:
-        results_raw = list(executor.map(download_image, cameras))
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        nested_results = list(executor.map(download_camera_images, cameras))
 
-    status_counts = Counter(status for status, _ in results_raw)
+    flat_results = [entry for group in nested_results for entry in group]
+    status_counts = Counter(status for status, _ in flat_results)
     print(f"Download-Statistik: {dict(status_counts)}")
 
-    downloaded = [payload for status, payload in results_raw if status == "ok" and payload]
-    if downloaded:
-        sample_cam = downloaded[0][0]
-        print("Beispiel funktionierende Kamera:", sample_cam["name"], "->", json.dumps(sample_cam["raw_egenskaper"], ensure_ascii=False)[:500])
-
+    downloaded = [item for status, item in flat_results if status == "ok" and item]
     print(f"{len(downloaded)} neue Kamerabilder geladen. Starte Elch-Erkennung...")
 
-    for cam, filename, img_hash in downloaded:
+    for item in downloaded:
+        filename = item["filename"]
         try:
             results = model(filename, conf=0.45, verbose=False)
             for r in results:
                 detected = [int(box.cls[0]) for box in r.boxes]
                 if any(cls in ANIMAL_CLASSES for cls in detected):
-                    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", cam["id"])
+                    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", item["id"])
                     out_file = f"hit_{safe_id}.jpg"
                     r.save(filename=out_file)
                     caption = (
                         f"🦌 Mögliche Elch-Sichtung!\n"
-                        f"📍 Ort: {cam['name']}\n"
-                        f"🔗 Live-Bild: {cam.get('active_url', cam['urls'][0])}"
+                        f"📍 Ort: {item['name']}\n"
+                        f"🔗 Live-Bild: {item['url']}"
                     )
                     send_telegram(out_file, caption)
-                    seen_images.add(img_hash)
-                    print(f"TREFFER gemeldet: {cam['name']}")
+                    seen_images.add(item["img_hash"])
+                    print(f"TREFFER gemeldet: {item['name']}")
                     if os.path.exists(out_file):
                         os.remove(out_file)
                     break
         except Exception as e:
-            print(f"Analysefehler bei {cam['name']}: {e}")
+            print(f"Analysefehler bei {item['name']}: {e}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)

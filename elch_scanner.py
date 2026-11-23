@@ -23,6 +23,9 @@ FYLKER = {
     54: "Troms og Finnmark", 55: "Troms", 56: "Finnmark"
 }
 
+# Eigenschaften, die keine Kamera-ID sind (z. B. Baujahr)
+IGNORE_ID_KEYWORDS = ("år", "year", "høyde", "bredde", "lengde", "retning", "avstand")
+
 model = YOLO("yolov8n.pt")
 ANIMAL_CLASSES = [17, 18, 19, 21]
 
@@ -34,16 +37,18 @@ else:
     seen_images = set()
 
 
-def build_image_urls(raw_id, direct_url=None):
+def build_image_urls(candidate_ids, direct_urls):
     urls = []
-    if direct_url and "kamera.atlas.vegvesen.no/api/images/" in direct_url:
-        urls.append(direct_url)
-    clean_id = str(raw_id).strip()
-    if clean_id:
-        for candidate in (clean_id, f"{clean_id}_1", f"{clean_id}_2", f"{clean_id}_3"):
-            if "_" in clean_id and candidate != clean_id:
-                continue
-            u = f"https://kamera.atlas.vegvesen.no/api/images/{candidate}"
+    for u in direct_urls:
+        if "kamera.atlas.vegvesen.no/api/images/" in u and u not in urls:
+            urls.append(u)
+    for raw_id in candidate_ids:
+        clean_id = str(raw_id).strip()
+        if not clean_id:
+            continue
+        variants = [clean_id] if "_" in clean_id else [clean_id, f"{clean_id}_1", f"{clean_id}_2", f"{clean_id}_3"]
+        for v in variants:
+            u = f"https://kamera.atlas.vegvesen.no/api/images/{v}"
             if u not in urls:
                 urls.append(u)
     return urls
@@ -51,9 +56,9 @@ def build_image_urls(raw_id, direct_url=None):
 
 def get_nvdb_cameras():
     cameras = []
-    seen_ids = set()
-    skipped_no_id = 0
-    sample_without_id = []
+    seen_keys = set()
+    tunnel_skipped = 0
+    public_samples = []
 
     url = "https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/163?inkluder=egenskaper,lokasjon&antall=1000"
     nvdb_headers = {
@@ -70,37 +75,58 @@ def get_nvdb_cameras():
                 break
             data = res.json()
             for obj in data.get("objekter", []):
+                obj_id = str(obj.get("id", ""))
                 egenskaper = obj.get("egenskaper", [])
-                ext_id = None
-                direct_url = None
+
+                # Tunnel-Überwachungskameras aussortieren
+                is_tunnel_cctv = any(
+                    (eg.get("id") == 1179 or str(eg.get("navn", "")).lower() == "type kamera")
+                    and str(eg.get("verdi", "")).lower() == "fast videokamera"
+                    for eg in egenskaper
+                )
+                if is_tunnel_cctv:
+                    tunnel_skipped += 1
+                    continue
+
+                if len(public_samples) < 3:
+                    public_samples.append(egenskaper)
+
+                direct_urls = []
+                candidate_ids = []
                 place = None
 
                 for eg in egenskaper:
                     val = eg.get("verdi")
                     navn = str(eg.get("navn", "")).lower()
+                    eg_type = str(eg.get("egenskapstype", ""))
 
                     if isinstance(val, str) and "http" in val:
-                        direct_url = val
+                        direct_urls.append(val.strip())
                         if "/api/images/" in val:
-                            ext_id = val.rstrip("/").split("/")[-1]
+                            candidate_ids.append(val.rstrip("/").split("/")[-1])
                         elif "id=" in val:
-                            ext_id = val.split("id=")[-1].split("&")[0]
-                    elif val and any(k in navn for k in ("webkamera", "kameraid", "kamera-id", "kameranummer", "ekstern")):
-                        if not ext_id:
-                            ext_id = str(val).strip()
-                    elif isinstance(val, str) and any(k in navn for k in ("stedsnavn", "navn", "beskrivelse", "plassering")):
-                        if not place:
-                            place = val
+                            candidate_ids.append(val.split("id=")[-1].split("&")[0])
+                    elif isinstance(val, str) and any(k in navn for k in ("stedsnavn", "navn", "beskrivelse", "plassering", "tittel")):
+                        if not place and navn != "type kamera":
+                            place = val.strip()
+                    elif val is not None and eg_type in ("Tekst", "Heltall") and not any(bad in navn for bad in IGNORE_ID_KEYWORDS):
+                        sval = str(val).strip()
+                        # Typische Kamera-IDs sind Zahlen oder Muster wie 3001032_1
+                        if re.fullmatch(r"[0-9]{4,12}(_[0-9]+)?", sval):
+                            candidate_ids.append(sval)
 
-                if not ext_id:
-                    skipped_no_id += 1
-                    if len(sample_without_id) < 2:
-                        sample_without_id.append(egenskaper)
+                # Fallback auf NVDB-Objekt-ID, falls kein eigenes ID-Feld gefüllt war
+                if not candidate_ids and not direct_urls and obj_id:
+                    candidate_ids.append(obj_id)
+
+                urls = build_image_urls(candidate_ids, direct_urls)
+                if not urls:
                     continue
 
-                if ext_id in seen_ids:
+                primary_key = candidate_ids[0] if candidate_ids else urls[0]
+                if primary_key in seen_keys:
                     continue
-                seen_ids.add(ext_id)
+                seen_keys.add(primary_key)
 
                 lok = obj.get("lokasjon", {})
                 vegsys = lok.get("vegsystemreferanser", [])
@@ -108,12 +134,11 @@ def get_nvdb_cameras():
                 fylke_ids = lok.get("fylker", [])
                 region = FYLKER.get(fylke_ids[0], "Norwegen") if fylke_ids else "Norwegen"
 
-                title = f"{place or 'Kamera ' + ext_id} – {road}" if road else (place or f"Kamera {ext_id}")
+                title = f"{place or 'Kamera ' + primary_key} – {road}" if road else (place or f"Kamera {primary_key}")
                 cameras.append({
-                    "id": ext_id,
+                    "id": primary_key,
                     "name": f"{title} ({region})",
-                    "urls": build_image_urls(ext_id, direct_url),
-                    "raw_egenskaper": egenskaper
+                    "urls": urls
                 })
 
             next_url = data.get("metadata", {}).get("neste", {}).get("href")
@@ -122,9 +147,9 @@ def get_nvdb_cameras():
             print(f"NVDB-Hinweis: {e}")
             break
 
-    print(f"NVDB-Auswertung: {len(cameras)} Kameras mit Web-ID gefunden, {skipped_no_id} Einträge ohne Web-ID übersprungen.")
-    if sample_without_id:
-        print("DIAGNOSE (Beispiel ohne Web-ID):", json.dumps(sample_without_id[0], ensure_ascii=False)[:500])
+    print(f"NVDB-Filter: {tunnel_skipped} Tunnelkameras übersprungen, {len(cameras)} öffentliche Kamerastandorte gefunden.")
+    if public_samples:
+        print("DIAGNOSE (Öffentliche Webcam-Felder):", json.dumps(public_samples, ensure_ascii=False)[:900])
 
     return cameras
 
@@ -158,7 +183,7 @@ def send_telegram(image_path, caption):
 
 def main():
     cameras = get_nvdb_cameras()
-    print(f"Prüfe {len(cameras)} Kameras in ganz Norwegen...")
+    print(f"Prüfe {len(cameras)} öffentliche Kameras in ganz Norwegen...")
 
     if not cameras:
         print("Abbruch: Keine Kameras gefunden.")
@@ -171,11 +196,6 @@ def main():
     print(f"Download-Statistik: {dict(status_counts)}")
 
     downloaded = [payload for status, payload in results_raw if status == "ok" and payload]
-    failed_cams = [payload for status, payload in results_raw if status not in ("ok", "cached") and payload]
-
-    if failed_cams:
-        print("DIAGNOSE (Beispiel fehlgeschlagene Kamera):", failed_cams[0]["name"], "->", json.dumps(failed_cams[0]["raw_egenskaper"], ensure_ascii=False)[:500])
-
     print(f"{len(downloaded)} neue Kamerabilder geladen. Starte Elch-Erkennung...")
 
     for cam, filename, img_hash in downloaded:

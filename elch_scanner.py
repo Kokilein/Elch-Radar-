@@ -1,5 +1,6 @@
 import os
 import json
+import xml.etree.ElementTree as ET
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from ultralytics import YOLO
@@ -9,7 +10,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "*/*",
     "X-Client": "elch-radar-norwegen"
 }
 
@@ -20,13 +21,6 @@ FYLKER = {
     40: "Telemark", 42: "Agder", 46: "Vestland", 50: "Trøndelag",
     54: "Troms og Finnmark", 55: "Troms", 56: "Finnmark"
 }
-
-DIRECT_WEBCAM_URLS = [
-    "https://trafikkinfo.atlas.vegvesen.no/trafikkinfo/webkamera/v1/kamera",
-    "https://trafikkinfo.atlas.vegvesen.no/trafikkinfo/webkamera/v2/kamera",
-    "https://webkamera.atlas.vegvesen.no/public/metadata",
-    "https://webkamera.atlas.vegvesen.no/public/kamera",
-]
 
 model = YOLO("yolov8n.pt")
 ANIMAL_CLASSES = [17, 18, 19, 21]
@@ -39,52 +33,58 @@ else:
     seen_images = set()
 
 
-def parse_direct_webcams(data):
+def parse_vegvesen_xml(xml_text):
     cameras = []
     seen_urls = set()
+    clean_xml = xml_text.lstrip("\ufeff \t\r\n")
+    root = ET.fromstring(clean_xml)
 
-    items = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        for key in ("kameraer", "cameras", "features", "items", "data", "webkameraer"):
-            if isinstance(data.get(key), list):
-                items = data[key]
-                break
-        if not items and all(isinstance(v, dict) for v in data.values()):
-            items = list(data.values())
-
-    for item in items:
-        if not isinstance(item, dict):
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1].lower()
+        if tag not in ("kamera", "webkamera", "camera", "webcam", "item"):
             continue
-        props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
-        merged = {**item, **props}
 
-        cam_id = merged.get("id") or merged.get("kameraId") or merged.get("cameraId") or merged.get("kameranummer")
+        fields = {k.lower(): v for k, v in elem.attrib.items() if v}
+        for child in elem.iter():
+            ctag = child.tag.split("}")[-1].lower()
+            if child.text and child.text.strip():
+                fields.setdefault(ctag, child.text.strip())
+
+        cam_id = (
+            fields.get("id")
+            or fields.get("kameraid")
+            or fields.get("cameraid")
+            or fields.get("kameranummer")
+        )
+
         img_url = None
-        for k, v in merged.items():
-            if isinstance(v, str) and ("http" in v or "vegvesen.no" in v):
-                img_url = v if v.startswith("http") else f"https://{v.lstrip('/')}"
+        for val in fields.values():
+            if isinstance(val, str) and ("http://" in val or "https://" in val):
+                img_url = val
                 break
 
         if not img_url and cam_id:
             img_url = f"https://webkamera.atlas.vegvesen.no/public/kamera?id={cam_id}"
 
         name = (
-            merged.get("stedsnavn")
-            or merged.get("navn")
-            or merged.get("name")
-            or merged.get("beskrivelse")
-            or merged.get("tittel")
+            fields.get("stedsnavn")
+            or fields.get("navn")
+            or fields.get("name")
+            or fields.get("beskrivelse")
+            or fields.get("tittel")
             or f"Kamera {cam_id}"
         )
-        fylke = merged.get("fylke") or merged.get("region") or "Norwegen"
+        road = fields.get("vegnummer") or fields.get("veg") or ""
+        fylke = fields.get("fylke") or fields.get("fylkesnavn") or fields.get("region") or "Norwegen"
+
+        title = f"{name} – {road}" if road else name
+        full_name = f"{title} ({fylke})"
 
         if img_url and img_url not in seen_urls:
             seen_urls.add(img_url)
             cameras.append({
                 "id": str(cam_id or len(cameras)),
-                "name": f"{name} ({fylke})",
+                "name": full_name,
                 "url": img_url
             })
 
@@ -92,90 +92,71 @@ def parse_direct_webcams(data):
 
 
 def get_all_cameras():
-    # 1. Direkte Statens vegvesen Webkamera-APIs testen
-    for endpoint in DIRECT_WEBCAM_URLS:
-        try:
-            res = requests.get(endpoint, headers=HEADERS, timeout=20)
-            if res.status_code == 200 and res.text.strip().startswith(("{", "[")):
-                cams = parse_direct_webcams(res.json())
+    # 1. Offizieller XML-Metadata-Feed von Statens vegvesen
+    meta_url = "https://webkamera.atlas.vegvesen.no/public/metadata"
+    try:
+        res = requests.get(meta_url, headers=HEADERS, timeout=25)
+        if res.status_code == 200 and res.text.strip():
+            text = res.text.lstrip("\ufeff \t\r\n")
+            if text.startswith("<"):
+                cams = parse_vegvesen_xml(text)
                 if cams:
-                    print(f"Erfolgreich {len(cams)} Kameras geladen über: {endpoint}")
+                    print(f"Erfolgreich {len(cams)} Kameras aus Vegvesen-XML geladen!")
                     return cams
+                else:
+                    print("DEBUG XML-Anfang:", text[:600])
             else:
-                print(f"Info {endpoint}: Status {res.status_code}")
-        except Exception as e:
-            print(f"Info {endpoint}: {e}")
+                print("DEBUG Antwort-Anfang:", text[:600])
+    except Exception as e:
+        print(f"Fehler beim XML-Abruf: {e}")
 
-    # 2. Fallback: NVDB API v4 (Objekttyp 67 = Kamera)
+    # 2. Fallback: NVDB API v4 Objekttyp 163 (Kamera)
     cameras = []
     seen_urls = set()
-    sample_debug = []
-    url = "https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/67?inkluder=egenskaper,lokasjon&antall=1000"
+    url = "https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/163?inkluder=egenskaper,lokasjon&antall=1000"
     nvdb_headers = {**HEADERS, "Accept": "application/vnd.vegvesen.nvdb-v4+json, application/json"}
 
     while url:
         try:
             res = requests.get(url, headers=nvdb_headers, timeout=25)
             if res.status_code != 200:
-                print(f"NVDB-Status: {res.status_code}")
                 break
-
             data = res.json()
-            objekter = data.get("objekter", [])
-            if not objekter:
-                break
-
-            for obj in objekter:
+            for obj in data.get("objekter", []):
                 cam_id = str(obj.get("id", ""))
-                egenskaper = obj.get("egenskaper", [])
-                if len(sample_debug) < 2:
-                    sample_debug.append(egenskaper)
-
                 img_url = None
                 web_cam_id = None
                 place = None
 
-                for eg in egenskaper:
+                for eg in obj.get("egenskaper", []):
                     val = eg.get("verdi")
                     navn = str(eg.get("navn", "")).lower()
-
-                    if isinstance(val, str) and ("http" in val or "vegvesen.no" in val or "webkamera" in val):
+                    if isinstance(val, str) and ("http" in val or "vegvesen.no" in val):
                         img_url = val if val.startswith("http") else f"https://{val.lstrip('/')}"
-                    elif any(k in navn for k in ("kamera", "ekstern", "nummer", "webkamera")) and val:
+                    elif any(k in navn for k in ("kamera", "ekstern", "nummer")) and val:
                         web_cam_id = str(val)
-                    elif isinstance(val, str) and any(k in navn for k in ("stedsnavn", "navn", "beskrivelse", "plassering", "tittel")):
-                        if not place:
-                            place = val
+                    elif isinstance(val, str) and any(k in navn for k in ("stedsnavn", "navn", "beskrivelse", "plassering")):
+                        place = place or val
 
                 if not img_url and web_cam_id:
                     img_url = f"https://webkamera.atlas.vegvesen.no/public/kamera?id={web_cam_id}"
 
                 lok = obj.get("lokasjon", {})
-                vegsys = lok.get("vegsystemreferanser", [])
-                road = vegsys[0].get("kortform", "").split(" ")[0] if vegsys else ""
                 fylke_ids = lok.get("fylker", [])
                 region = FYLKER.get(fylke_ids[0], "Norwegen") if fylke_ids else "Norwegen"
-
-                title = place or f"Kamera {cam_id}"
-                full_name = f"{title} – {road} ({region})" if road else f"{title} ({region})"
 
                 if img_url and img_url not in seen_urls:
                     seen_urls.add(img_url)
                     cameras.append({
                         "id": cam_id,
-                        "name": full_name,
+                        "name": f"{place or 'Kamera ' + cam_id} ({region})",
                         "url": img_url
                     })
 
             next_url = data.get("metadata", {}).get("neste", {}).get("href")
             url = next_url if next_url and next_url != url else None
-
-        except Exception as e:
-            print(f"NVDB-Fehler: {e}")
+        except Exception:
             break
-
-    if not cameras and sample_debug:
-        print("DEBUG NVDB-Felder:", json.dumps(sample_debug, ensure_ascii=False)[:1000])
 
     return cameras
 

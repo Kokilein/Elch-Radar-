@@ -51,4 +51,15 @@ jobs:
 
       - name: Norwegen nach Elchen scannen
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python elch_scanner.py
+
+      - name: Verlauf speichern
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "ElchBot"
+          git add seen_moose.json || true
+          git commit -m "Update seen moose" || exit 0
+          git pull --rebase
+          git push

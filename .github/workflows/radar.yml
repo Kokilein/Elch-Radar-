@@ -27,12 +27,12 @@ jobs:
         run: |
           TOKEN=$(printf '%s' "$RAW_TOKEN" | tr -d '[:space:]')
           CID=$(printf '%s' "$RAW_CHAT_ID" | tr -d '[:space:]')
-          RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d "chat_id=${CID}" -d "text=🦌 Elch-Radar Test: Die Verbindung zu GitHub steht!")
+          RESPONSE=$(curl -4 -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d "chat_id=${CID}" -d "text=🦌 Elch-Radar Test: Die Verbindung zu GitHub steht!")
           echo "$RESPONSE"
           if echo "$RESPONSE" | grep -q '"error_code":429'; then
             echo "Kurze Telegram-Pause (35s), versuche es gleich noch einmal..."
             sleep 35
-            curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d "chat_id=${CID}" -d "text=🦌 Elch-Radar Test: Die Verbindung zu GitHub steht!"
+            curl -4 -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d "chat_id=${CID}" -d "text=🦌 Elch-Radar Test: Die Verbindung zu GitHub steht!"
           fi
 
       - name: Code laden

@@ -2,13 +2,18 @@ import os
 import re
 import time
 import json
+import socket
 from collections import Counter
 import requests
+import urllib3.util.connection as urllib3_cn
 from concurrent.futures import ThreadPoolExecutor
 from ultralytics import YOLO
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+# Erzwingt IPv4, damit Telegram-Requests auf GitHub Actions nicht in IPv6-Rate-Limits laufen
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
+CHAT_ID = os.environ["CHAT_ID"].strip()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -24,10 +29,8 @@ FYLKER = {
     54: "Troms og Finnmark", 55: "Troms", 56: "Finnmark"
 }
 
-# yolov8s ist deutlich treffsicherer bei Tieren als yolov8n und vermeidet Schneehaufen-Fehlalarme
 model = YOLO("yolov8s.pt")
 
-# COCO-Klassen für große Tiere (17=Pferd, 18=Schaf, 19=Kuh, 21=Bär)
 ANIMAL_CLASSES = {17: "Pferd/Elch", 18: "Schaf/Rentier", 19: "Kuh/Elch", 21: "Bär/Elch"}
 CONFIDENCE_THRESHOLD = 0.58
 MAX_ALERTS_PER_RUN = 5
@@ -213,7 +216,6 @@ def main():
             if os.path.exists(filename):
                 os.remove(filename)
 
-    # Nach höchster Treffer-Wahrscheinlichkeit sortieren und max. 5 pro Lauf senden
     hits.sort(key=lambda x: x[0], reverse=True)
     print(f"Gefundene Treffer über {int(CONFIDENCE_THRESHOLD * 100)}%: {len(hits)}")
 

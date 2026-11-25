@@ -2,8 +2,8 @@ name: Elch Radar Norwegen
 
 on:
   schedule:
-    # Läuft alle 15 Minuten rund um die Uhr
-    - cron: '*/15 * * * *'
+    # Läuft alle 10 Minuten rund um die Uhr
+    - cron: '*/10 * * * *'
   # Erlaubt dir zusätzlich, das Skript jederzeit manuell per Klick zu starten
   workflow_dispatch:
 

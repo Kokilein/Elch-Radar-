@@ -31,7 +31,8 @@ FYLKER = {
 
 model = YOLO("yolov8s.pt")
 
-ANIMAL_CLASSES = {17: "Pferd/Elch", 18: "Schaf/Rentier", 19: "Kuh/Elch", 21: "Bär/Elch"}
+ANIMAL_CLASSES = {14: "Vogel", 15: "Katze/Luchs", 16: "Hund/Fuchs/Wolf", 17: "Pferd/Elch", 18: "Schaf/Rentier", 19: "Kuh/Elch", 20: "Elefant/Großtier", 21: "Bär/Vielfraß", 22: "Zebra/Großtier", 23: "Giraffe/Elch"}
+
 CONFIDENCE_THRESHOLD = 0.58
 MAX_ALERTS_PER_RUN = 5
 

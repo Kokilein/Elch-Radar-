@@ -31,7 +31,15 @@ FYLKER = {
 
 model = YOLO("yolov8s.pt")
 
-ANIMAL_CLASSES = {15: "Katze/Luchs", 16: "Hund/Fuchs/Wolf", 17: "Pferd/Elch", 18: "Schaf/Rentier", 19: "Kuh/Elch", 20: "Elefant/Großtier", 21: "Bär/Vielfraß", 22: "Zebra/Großtier", 23: "Giraffe/Elch"}
+ANIMAL_CLASSES = {15: "Katze/Luchs",
+    16: "Hund/Fuchs/Wolf",
+    17: "Pferd/Elch",
+    18: "Schaf/Rentier",
+    19: "Kuh/Elch",
+    20: "Elefant/Großtier",
+    21: "Bär/Vielfraß",
+    22: "Zebra/Großtier",
+    23: "Giraffe/Elch"}
 
 CONFIDENCE_THRESHOLD = 0.50
 MAX_ALERTS_PER_RUN = 5
@@ -192,7 +200,12 @@ def main():
     for item in downloaded:
         filename = item["filename"]
         try:
-            results = model(filename, conf=CONFIDENCE_THRESHOLD, verbose=False)
+            results = model(
+                filename,
+                conf=CONFIDENCE_THRESHOLD,
+                classes=list(ANIMAL_CLASSES.keys()),
+                verbose=False
+            )
             best_conf = 0.0
             best_label = None
             best_result = None

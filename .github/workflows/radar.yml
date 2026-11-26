@@ -38,11 +38,6 @@ jobs:
       - name: Code laden
         uses: actions/checkout@v4
 
-      - name: Python einrichten
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: KI-Bibliotheken installieren
         run: |
           pip install ultralytics requests --extra-index-url https://download.pytorch.org/whl/cpu

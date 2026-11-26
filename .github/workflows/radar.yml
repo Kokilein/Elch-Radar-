@@ -2,9 +2,9 @@ name: Elch Radar Norwegen
 
 on:
   schedule:
-    # Läuft alle 10 Minuten rund um die Uhr
-    - cron: '*/10 * * * *'
-  # Erlaubt dir zusätzlich, das Skript jederzeit manuell per Klick zu starten
+    # ~12-Minuten-Takt abseits der vollen Viertelstunden
+    - cron: '6,18,31,43,54 * * * *'
+# Erlaubt dir zusätzlich, das Skript jederzeit manuell per Klick zu starten
   workflow_dispatch:
 
 # Verhindert, dass sich zwei Durchläufe gleichzeitig in die Quere kommen
